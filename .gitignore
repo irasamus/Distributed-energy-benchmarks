@@ -1,0 +1,11 @@
+# Maven
+target/
+*.class
+
+# Elixir / Erlang
+_build/
+deps/
+*.beam
+
+# OS files
+.DS_Store
