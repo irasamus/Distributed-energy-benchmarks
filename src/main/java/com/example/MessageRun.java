@@ -106,26 +106,34 @@ public class MessageRun {
         });
     }
 
-    // 5. MAIN
     public static void main(String[] args) {
-        String port = (args.length > 0) ? args[0] : "2551";
-        // Start with a smaller limit (e.g., 10,000) to verify it works, then increase for benchmark
-        int messageLimit = 10000; 
+        if (args.length < 3) {
+            System.out.println("Usage: MessageRun <port> <localIp> <seedIp>");
+            System.exit(1);
+        }
+
+        String port = args[0];
+        String localIp = args[1];
+        String seedIp = args[2];
+        int messageLimit = 1000000; 
 
         String configString = 
             "akka.actor.provider = cluster\n" +
-            "akka.actor.serialization-bindings { \"" + MessageSerializable.class.getName() + "\" = jackson-cbor }\n" +
-            "akka.remote.artery.canonical.hostname = \"127.0.0.1\"\n" +
             "akka.remote.artery.canonical.port = " + port + "\n" +
-            "akka.cluster.seed-nodes = [\"akka://MessageSystem@127.0.0.1:2551\"]";
+            "akka.remote.artery.canonical.hostname = \"" + localIp + "\"\n" +
+            "akka.cluster.seed-nodes = [\"akka://MessageSystem@" + seedIp + ":2551\"]\n" +
+            "akka.actor.serialization-bindings {\n" +
+            "  \"com.example.MessageRun$MessageSerializable\" = jackson-cbor\n" +
+            "}";
 
-        Config config = ConfigFactory.parseString(configString);
+        Config config = ConfigFactory.parseString(configString).withFallback(ConfigFactory.load());
 
         if (port.equals("2551")) {
             ActorSystem.create(pongerBehavior(), "MessageSystem", config);
-            System.out.println("Node B (Ponger) is UP on port 2551");
+            System.out.println("Node B (Ponger) is UP on " + localIp + ":2551");
         } else {
             ActorSystem.create(createDiscovery(messageLimit), "MessageSystem", config);
+            System.out.println("Node A (Pinger) is UP on " + localIp + ":" + port);
         }
     }
 }

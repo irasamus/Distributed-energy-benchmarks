@@ -1,48 +1,36 @@
 defmodule DistSpawner do
+  @total_actors 1_000_000
+
   def worker_task(parent) do
-    # Simply tell the master we are done
     send(parent, :done)
   end
 
-  def run_master(worker_node, total_actors) do
-    # Ensure the nodes are actually connected before starting
-    if Node.connect(worker_node) do
-      IO.puts("Connected to #{worker_node}")
+  def run_master(worker_node) do
+    # Connect to the remote Grid'5000 node
+    Node.connect(worker_node)
 
-      startTime = System.system_time(:millisecond)
-      IO.puts("LOG_START:#{startTime}")
+    startTime = System.system_time(:millisecond)
+    IO.puts("LOG_START:#{startTime}")
 
-      # SEQUENTIAL LOOP: Matches Akka SpawnRunner
-      Enum.each(1..total_actors, fn i ->
-        # 1. Trigger remote spawn
-        Node.spawn(worker_node, DistSpawner, :worker_task, [self()])
+    Enum.each(1..@total_actors, fn i ->
+      Node.spawn(worker_node, DistSpawner, :worker_task, [self()])
+      receive do :done -> :ok end
 
-        # 2. Wait for the ':done' reply before doing the next one
-        receive do
-          :done -> :ok
-        end
+      if rem(i, 50000) == 0 do
+        IO.puts("Progress: #{i} / #{@total_actors}")
+      end
+    end)
 
-        # Progress logging every 5000 (just like Akka)
-        if rem(i, 5000) == 0 do
-          IO.puts("Spawned: #{i} / #{total_actors}")
-        end
-      end)
-
-      endTime = System.system_time(:millisecond)
-      IO.puts("LOG_END:#{endTime}")
-      IO.puts("Total time for #{total_actors} sequential spawns: #{endTime - startTime}ms")
-    else
-      IO.puts("Error: Could not connect to #{worker_node}")
-    end
-
+    endTime = System.system_time(:millisecond)
+    IO.puts("LOG_END:#{endTime}")
     System.halt(0)
   end
 end
 
 case System.argv() do
   ["worker"] ->
-    IO.puts("Worker node ready.")
+    IO.puts("Worker ready.")
     Process.sleep(:infinity)
-  ["master", node, count] ->
-    DistSpawner.run_master(String.to_atom(node), String.to_integer(count))
+  ["master", node] ->
+    DistSpawner.run_master(String.to_atom(node))
 end

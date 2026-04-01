@@ -123,27 +123,38 @@ public class TrapezoidRun {
         }
     }
 
-    // --- 5. MAIN ---
     public static void main(String[] args) {
-        String port = (args.length > 0) ? args[0] : "2551";
-        long totalIntervals = 1000000000L; // 1 Billion (adjust for your machine)
-        int numWorkersExpected = 2; // We wait for 2 remote nodes
+        if (args.length < 3) {
+            System.out.println("Usage: TrapezoidRun <port> <localIp> <seedIp>");
+            System.exit(1);
+        }
 
-        Config config = ConfigFactory.parseString(
+        String port = args[0];
+        String localIp = args[1];
+        String seedIp = args[2];
+        
+        long totalIntervals = 1000000000L; 
+        int numWorkersExpected = 2; // Node 2551 and Node 2553
+
+        String configString = 
             "akka.actor.provider = cluster\n" +
-            "akka.actor.serialization-bindings { \"" + TrapezoidSerializable.class.getName() + "\" = jackson-cbor }\n" +
-            "akka.remote.artery.canonical.hostname = \"127.0.0.1\"\n" +
             "akka.remote.artery.canonical.port = " + port + "\n" +
-            "akka.cluster.seed-nodes = [\"akka://TrapezoidSystem@127.0.0.1:2551\"]"
-        );
+            "akka.remote.artery.canonical.hostname = \"" + localIp + "\"\n" +
+            "akka.cluster.seed-nodes = [\"akka://TrapezoidSystem@" + seedIp + ":2551\"]\n" +
+            "akka.actor.serialization-bindings {\n" +
+            "  \"com.example.TrapezoidRun$TrapezoidSerializable\" = jackson-cbor\n" +
+            "}";
+
+        Config config = ConfigFactory.parseString(configString).withFallback(ConfigFactory.load());
 
         if (port.equals("2552")) {
             // NODE A: Master
             ActorSystem.create(masterBehavior(totalIntervals, numWorkersExpected), "TrapezoidSystem", config);
+            System.out.println("Master Node (2552) started on " + localIp);
         } else {
-            // NODE B or C: Worker
+            // NODE B (2551) or C (2553): Worker
             ActorSystem.create(workerBehavior(), "TrapezoidSystem", config);
-            System.out.println("Worker Node UP on port " + port);
+            System.out.println("Worker Node UP on " + localIp + ":" + port);
         }
     }
 }

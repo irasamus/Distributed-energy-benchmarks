@@ -100,15 +100,21 @@ public class SpawnRunner {
 
     // 5. MAIN
     public static void main(String[] args) {
-        String port = (args.length > 0) ? args[0] : "2551";
-        // Change this number to whatever you need for your benchmark
-        int totalToSpawn = 100000; 
+        if (args.length < 3) {
+            System.out.println("Usage: SpawnRunner <port> <localIp> <seedIp>");
+            System.exit(1);
+        }
+
+        String port = args[0];
+        String localIp = args[1];
+        String seedIp = args[2];
+        int totalToSpawn = 1000000; 
 
         String configString = 
             "akka.actor.provider = cluster\n" +
             "akka.remote.artery.canonical.port = " + port + "\n" +
-            "akka.remote.artery.canonical.hostname = \"127.0.0.1\"\n" +
-            "akka.cluster.seed-nodes = [\"akka://SpawnSystem@127.0.0.1:2551\"]\n" +
+            "akka.remote.artery.canonical.hostname = \"" + localIp + "\"\n" +
+            "akka.cluster.seed-nodes = [\"akka://SpawnSystem@" + seedIp + ":2551\"]\n" +
             "akka.actor.serialization-bindings {\n" +
             "  \"com.example.SpawnRunner$MySerializable\" = jackson-cbor\n" +
             "}";
@@ -117,10 +123,10 @@ public class SpawnRunner {
 
         if (port.equals("2551")) {
             ActorSystem.create(spawnerBehavior(), "SpawnSystem", config);
-            System.out.println("Node B (Spawner) is UP.");
+            System.out.println("Node B (Spawner) is UP on " + localIp + ":2551");
         } else {
             ActorSystem.create(Behaviors.setup(ctx -> new Master(ctx, totalToSpawn)), "SpawnSystem", config);
-            System.out.println("Node A (Master) is UP.");
+            System.out.println("Node A (Master) is UP on " + localIp + ":" + port + " connecting to seed " + seedIp);
         }
     }
 }
