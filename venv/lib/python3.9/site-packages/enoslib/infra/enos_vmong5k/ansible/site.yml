@@ -1,0 +1,152 @@
+---
+- name: This is a play for virtual machines on Grid'5000
+  hosts: all
+  vars:
+    pubkey: "{{lookup('file', '~/.ssh/id_rsa.pub')}}"
+  # NOTE(msimonin): quick fix for buster
+  # The libvirt runtime dir (e.g with the socket) will be created in the home
+  # dir instead of in /run/user/$UID
+  # environment:
+  #   XDG_RUNTIME_DIR: "/tmp/{{ g5k_user }}-runtime-dir"
+
+  tasks:
+    - name: Enable nested virtualization
+      shell: |
+        modprobe -r kvm_intel
+        modprobe kvm_intel nested=1
+
+    - name: list only running VMs
+      virt:
+        command: list_vms
+        state: running
+      register: running_vms
+
+    - debug: var=running_vms.list_vms
+
+    - name: Create the working directory
+      file:
+        path: "{{ working_dir }}"
+        state: directory
+        mode: 0711
+
+    - name: Create the libvirt image directory
+      file:
+        path: "{{ libvirt_dir }}"
+        state: directory
+
+    - name: Bind mount image directory
+      mount:
+        src: "{{ working_dir }}"
+        path: "{{ libvirt_dir }}"
+        opts: bind
+        state: mounted
+        fstype: none
+
+    - name: Restart libvirt
+      service:
+        name: libvirtd
+        state: restarted
+
+    - name: Creating cloud init data directory
+      file:
+        path: "{{ libvirt_dir }}/cloud-init-data-{{ item.alias }}"
+        state: directory
+      loop: "{{ vms[inventory_hostname] }}"
+      when: item.alias not in running_vms.list_vms
+
+    - name: Generate meta-data for cloud-init
+      template:
+        src: meta-data.j2
+        dest: "{{ libvirt_dir }}/cloud-init-data-{{ item.alias }}/meta-data"
+      loop: "{{ vms[inventory_hostname] }}"
+      when: item.alias not in running_vms.list_vms
+
+    - name: Generate g5k_user data for cloud-init
+      template:
+        src: user-data.j2
+        dest: "{{ libvirt_dir }}/cloud-init-data-{{ item.alias }}/user-data"
+      loop: "{{ vms[inventory_hostname] }}"
+      when: item.alias not in running_vms.list_vms
+
+    #  Create one iso per vm
+    - name: Create the iso for cloud-init
+      shell: >
+        cd {{ libvirt_dir }}
+        &&
+        genisoimage -output cloud-init-data-{{ item.alias }}.iso -volid cidata -joliet -rock cloud-init-data-{{ item.alias }}/user-data cloud-init-data-{{ item.alias }}/meta-data
+      loop: "{{ vms[inventory_hostname] }}"
+      when:
+        item.alias not in running_vms.list_vms
+        #    - name: Copy base image
+
+      # shell: >
+      #  ls {{ working_dir }}/enos_vmong5k-base-image.qcow2
+      #  ||
+      #  cp {{ base_image }} {{ working_dir }}/enos_vmong5k-base-image.qcow2
+      # become: yes
+      # become_user: "{{ g5k_user }}"
+    - set_fact:
+        taktuk_hosts: "{% for h in ansible_play_batch %} -m {{ h }} {% endfor %}"
+
+    - set_fact:
+        taktuk_command: "taktuk -s {{ taktuk_hosts }} broadcast put [ {{ base_image }} ] [ {{ libvirt_dir }}/enos_vmong5k-base-image.qcow2 ]"
+
+    - name: Copy (using taktuk) the base image
+      shell: >
+        ls {{ libvirt_dir }}/enos_vmong5k-base-image.qcow2
+        ||
+        {{ taktuk_command }}
+      run_once: yes
+      when: enable_taktuk | bool
+
+    - name: Copy (regular copy) the base image
+      shell: >
+        ls {{ libvirt_dir }}/enos_vmong5k-base-image.qcow2
+        ||
+        cp  {{ base_image }} {{ libvirt_dir }}/enos_vmong5k-base-image.qcow2
+      when: not enable_taktuk | bool
+
+    # we explicitly use the libvirt_dir here because libvirt cannot be fooled
+    # at some point, using the working dir will make libvirt realize that an
+    # image is outside the /var/lib/libvirt/images directory and raise a
+    # permission denied
+    - name: Applying COW strategy for the image
+      shell: |
+        qemu-img create -f qcow2 -o backing_file={{ libvirt_dir }}/enos_vmong5k-base-image.qcow2 {{ libvirt_dir }}/{{ item.alias }}
+        # I know ...
+        chmod 777 {{ libvirt_dir }}/{{ item.alias }}
+      loop: "{{ vms[inventory_hostname] }}"
+      when:
+        - _strategy == "cow"
+        - item.alias not in running_vms.list_vms
+
+    - name: Applying COPY strategy for the image
+      shell: |
+        cp {{ libvirt_dir }}/enos_vmong5k-base-image.qcow2 {{ libvirt_dir }}/{{ item.alias }}
+        # I know ...
+        chmod 777 {{ libvirt_dir }}/{{ item.alias }}
+      loop: "{{ vms[inventory_hostname] }}"
+      when:
+        - _strategy == "copy"
+        - item.alias not in running_vms.list_vms
+
+    - name: Create an extra disk (if any)
+      shell: "qemu-img create -f raw  {{ item.disk.path }} {{ item.disk.size }}"
+      args:
+        creates: "{{ item.disk.path }}"
+      loop: "{{ vms[inventory_hostname] }}"
+      when:
+        - item.disk is defined
+        - item.disk is not none
+
+    - name: Dump xml domain files
+      template:
+        dest: "{{ libvirt_dir }}/{{ item.alias }}.xml"
+        src: domain.xml.j2
+      loop: "{{ vms[inventory_hostname] }}"
+      when: item.alias not in running_vms.list_vms
+
+    - name: Start virtual machines
+      shell: "virsh create {{  libvirt_dir }}/{{ item.alias }}.xml"
+      loop: "{{ vms[inventory_hostname] }}"
+      when: item.alias not in running_vms.list_vms

@@ -1,0 +1,1147 @@
+"""
+This module is composed of helpers functions to deal with the Grid'5000 REST
+API.
+
+It wraps the python-grid5000 library to provide some usual routines to interact
+with the platform.
+"""
+
+import copy
+import os
+import re
+import threading
+import time
+from collections import defaultdict, namedtuple
+from datetime import datetime, timezone
+from functools import lru_cache
+from typing import (
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableSequence,
+    Optional,
+    Tuple,
+    Union,
+)
+from zoneinfo import ZoneInfo
+
+from grid5000 import Grid5000
+from grid5000.exceptions import Grid5000DeleteError
+from grid5000.objects import Cluster, Job, Node, Site, Vlan
+
+from enoslib.infra.utils import _date2h
+from enoslib.log import getLogger
+
+from .constants import (
+    KAVLAN,
+    KAVLAN_GLOBAL,
+    KAVLAN_IDS,
+    KAVLAN_LOCAL,
+    KAVLAN_LOCAL_IDS,
+    NATURE_PROD,
+    PROD_VLAN_ID,
+)
+from .error import (
+    EnosG5kDuplicateJobsError,
+    EnosG5kInvalidArgumentsError,
+    EnosG5kKavlanNodesError,
+    EnosG5kWalltimeFormatError,
+)
+
+logger = getLogger(__name__, ["G5k"])
+
+
+_api_lock = threading.Lock()
+# Keep track of the api client
+_api_client = None
+
+
+class Client(Grid5000):
+    """Wrapper of the python-grid5000 client.
+
+    It accepts extra parameters to be set in the configuration file.
+    """
+
+    def __init__(self, excluded_sites: Optional[List] = None, **kwargs):
+        """Constructor.
+
+        Args:
+            excluded_sites (list): sites to forget about when reloading the
+                jobs. The primary use case was to exclude unreachable sites and
+                allow the program to go on.
+        """
+        super().__init__(**kwargs)
+        self.excluded_sites = excluded_sites if excluded_sites is not None else []
+
+
+# Lightweight representation of a network returned by OAR
+# descriptor is the cidr for a subnet or an id for vlan (prod=="DEFAULT")
+OarNetwork = namedtuple("OarNetwork", ["site", "nature", "descriptor"])
+
+
+def to_vlan_nature(vlan_id: str) -> str:
+    # TODO(msimonin): replace that by an api call to get the nature
+    if vlan_id in KAVLAN_LOCAL_IDS:
+        return KAVLAN_LOCAL
+    if vlan_id in KAVLAN_IDS:
+        return KAVLAN
+    return KAVLAN_GLOBAL
+
+
+def to_subnet_nature(cidr: str) -> str:
+    return f"slash_{cidr[-2:]}"
+
+
+def to_prod_nature() -> str:
+    return "DEFAULT"
+
+
+def get_api_client() -> Client:
+    """Gets the reference to the API client (singleton)."""
+    with _api_lock:
+        global _api_client
+        if not _api_client:
+            conf_file = os.path.join(os.environ["HOME"], ".python-grid5000.yaml")
+            _api_client = Client.from_yaml(conf_file)
+
+        return _api_client
+
+
+def grid_reload_jobs_from_ids(oargrid_jobids: Iterable[Tuple]) -> List[Job]:
+    """Reload jobs of Grid'5000 from their ids
+
+    Args:
+        oargrid_jobids (list): list of ``(site, oar_jobid)`` identifying the
+            jobs on each site
+
+    Returns:
+        The list of python-grid5000 jobs retrieved
+    """
+    gk = get_api_client()
+    jobs = []
+    for site, job_id in oargrid_jobids:
+        jobs.append(gk.sites[site].jobs[job_id])
+    return jobs
+
+
+def grid_reload_jobs_from_name(
+    job_name: str, restrict_to: Optional[Iterable[str]] = None
+) -> List[Job]:
+    """Reload all running or pending jobs of Grid'5000 with a given name.
+
+    By default, all the sites will be searched for jobs with the name
+    ``job_name``. Using EnOSlib there can be only one job per site with name
+    ``job_name``.
+
+    Note that it honors the ``exluded_sites`` attribute of the client so the
+    scan can be reduced.
+
+    Args:
+        job_name (str): the job name
+        restrict_to: restrict the action to these sites only.
+            If None is passed, no restriction applies and the action will be
+            taken on all possible sites
+
+    Returns:
+        The list of the python-grid5000 jobs retrieved.
+
+    Raises:
+        EnosG5kDuplicateJobsError: if there's several jobs with the same name
+            on a site.
+    """
+    gk = get_api_client()
+    sites = get_all_sites_obj()
+    if restrict_to is None:
+        restrict_to = [s.uid for s in sites]
+
+    jobs: List[Job] = []
+    for site in [
+        s for s in sites if s.uid not in gk.excluded_sites and s.uid in restrict_to
+    ]:
+        logger.debug("Reloading %s from %s", job_name, site.uid)
+        _jobs = site.jobs.list(
+            name=job_name, state="waiting,launching,running", user=get_api_username()
+        )
+        if len(_jobs) == 1:
+            logger.info("Reloading %s from %s", _jobs[0].uid, site.uid)
+            jobs.append(_jobs[0])
+        elif len(_jobs) > 1:
+            raise EnosG5kDuplicateJobsError(site, job_name)
+    # finally refresh them
+    # this adds some extra info (assigned_nodes)
+    for job in jobs:
+        job.refresh()
+    return jobs
+
+
+def grid_reload_from_ids(oargrid_jobids: Iterable[Tuple]) -> List[Job]:
+    """Reload all running or pending jobs of Grid'5000 from their ids
+
+    Args:
+        oargrid_jobids (list): list of ``(site, oar_jobid)`` identifying the
+            jobs on each site
+
+    Returns:
+        The list of python-grid5000 jobs retrieved
+    """
+    jobs = grid_reload_jobs_from_ids(oargrid_jobids)
+    return jobs
+
+
+def build_resources(
+    jobs: Iterable[Job],
+) -> Tuple[List[str], List[OarNetwork]]:
+    """Build the resources from the list of jobs.
+
+    Args:
+        jobs (list): The list of python-grid5000 jobs
+
+    Returns:
+        nodes, networks tuple where
+            - nodes is a list of all the nodes of the various reservations
+            - networks is a list of all the networks of the various reservation
+    """
+    nodes: List[str] = []
+    networks: List[OarNetwork] = []
+    for job in jobs:
+        # can have several subnet like this (e.g. when requesting a /16)
+        # [...]
+        # "subnets": [
+        #     "10.158.0.0/22",
+        #       ...,
+        # ]
+        _subnets = job.resources_by_type.get("subnets", [])
+        # [...]
+        # "vlans": [
+        #     "4"
+        # ]
+        _vlans = job.resources_by_type.get("vlans", [])
+        nodes = nodes + job.assigned_nodes
+        site = job.site
+        networks += [
+            OarNetwork(site=site, nature=to_subnet_nature(subnet), descriptor=subnet)
+            for subnet in _subnets
+        ]
+        networks += [
+            OarNetwork(
+                site=site, nature=to_vlan_nature(vlan_id), descriptor=str(vlan_id)
+            )
+            for vlan_id in _vlans
+        ]
+        # always add the Production network
+        networks += [OarNetwork(site=site, nature=NATURE_PROD, descriptor=PROD_VLAN_ID)]
+
+    logger.debug("nodes=%s, networks=%s", nodes, networks)
+    return nodes, networks
+
+
+def job_delete(job: Job, wait: bool = False):
+    # In the event that a job has already been killed when we try to kill it,
+    # we ignore the error raised by Grid5000 to warn us
+    try:
+        job.delete()
+    except Grid5000DeleteError as error:
+        search = re.search(
+            "This job was already killed",
+            format(error),
+        )
+        if search is None:
+            raise error
+    if not wait:
+        return
+    while job.state in ["running", "waiting", "launching"]:
+        logger.debug("Waiting for the job (%s, %s) to be killed", job.site, job.uid)
+        time.sleep(1)
+        job.refresh()
+    logger.info("Job killed (%s, %s)", job.site, job.uid)
+
+
+def grid_destroy_from_name(
+    job_name: str,
+    wait: bool = False,
+    restrict_to: Optional[Iterable[str]] = None,
+):
+    """Destroy all the jobs with a given name.
+
+    Args:
+        job_name (str): the job name
+        wait: True whether we should wait for a status change
+        restrict_to: restrict the action to these sites only.
+            If None is passed, no restriction applies and the action will be
+            taken on all possible sites
+    """
+    jobs = grid_reload_jobs_from_name(job_name, restrict_to=restrict_to)
+    for job in jobs:
+        logger.info("Killing the job (%s, %s)", job.site, job.uid)
+        job_delete(job, wait=wait)
+
+
+def grid_destroy_from_ids(oargrid_jobids: Iterable[Tuple], wait: bool = False):
+    """Destroy all the jobs with corresponding ids
+
+    Args:
+        oargrid_jobids (list): the ``(site, oar_job_id)`` list of tuple
+            identifying the jobs for each site.
+        wait: True whether we should wait for a status change
+    """
+    jobs = grid_reload_from_ids(oargrid_jobids)
+    for job in jobs:
+        job_delete(job, wait=wait)
+        logger.info("Killing the jobs %s", oargrid_jobids)
+
+
+def submit_jobs(job_specs: List[Tuple]) -> List[Job]:
+    """Submit a job
+
+    Args:
+        job_specs (dict): The job specification (see Grid'5000 API reference)
+    """
+    gk = get_api_client()
+    jobs = []
+    try:
+        for site, job_spec in job_specs:
+            logger.info("Submitting %s on %s", job_spec, site)
+            jobs.append(gk.sites[site].jobs.create(job_spec))
+    except Exception as err:
+        logger.error("An error occurred during the job submissions")
+        logger.error("Cleaning the jobs created")
+        for job in jobs:
+            job.delete()
+        raise err
+
+    return jobs
+
+
+def wait_for_jobs(jobs: Iterable):
+    """Waits for all the jobs to be runnning.
+
+    Args:
+        jobs (list): list of the python-grid5000 jobs to wait for
+
+
+    Raises:
+        Exception: if one of the job gets in error state.
+    """
+
+    all_running = False
+    waiting_interval = 0
+    while not all_running:
+        all_running = True
+        if waiting_interval < 45:
+            # Start with linear backoff to stay reactive (OAR might take a bit
+            # of time to start jobs, even if resources are free)
+            waiting_interval += 5
+        else:
+            waiting_interval = 150
+        logger.info(
+            "Waiting for %d seconds before next OAR job(s) check...", waiting_interval
+        )
+        time.sleep(waiting_interval)
+        for job in jobs:
+            job.refresh()
+            scheduled = getattr(job, "scheduled_at", None)
+            if scheduled is not None:
+                logger.info(
+                    "Job %s on %s: scheduled for %s",
+                    job.uid,
+                    job.site,
+                    _date2h(scheduled),
+                )
+            else:
+                logger.info("Job %s on %s: no schedule estimate", job.uid, job.site)
+            all_running = all_running and job.state == "running"
+            if job.state == "error":
+                raise Exception(f"The job {job} is in error state")
+    logger.info("All jobs are Running !")
+
+
+def set_nodes_vlan(nodes: List[str], interface: str, vlan_id: str):
+    """Set the interface of the nodes in a specific vlan.
+
+    All nodes need to belong to the same Grid'5000 site.
+
+    It is assumed that the same interface name is available on all nodes.
+
+    Args:
+        nodes(list): nodes to consider
+        interface(str): the network interface to put in the vlan
+        vlan_id(str): the id of the vlan
+
+    Raises:
+        EnosG5kInvalidArgument: if not all nodes belong to the same site.
+        EnosG5kKavlanNodesError: if some nodes couldn't be added to the VLAN.
+    """
+
+    def _to_network_address(host) -> str:
+        """Translate a host to a network address
+        e.g:
+        paranoia-20.rennes.grid5000.fr -> paranoia-20-eth2.rennes.grid5000.fr
+        """
+        splitted = host.split(".")
+        splitted[0] = splitted[0] + "-" + interface
+        return ".".join(splitted)
+
+    sites = {n.split(".")[1] for n in nodes}
+    if len(sites) > 1:
+        raise EnosG5kInvalidArgumentsError(
+            f"Cannot set nodes in VLAN because they belong to different sites: {nodes}"
+        )
+    site = sites.pop()
+    gk = get_api_client()
+    network_addresses = [_to_network_address(n) for n in nodes]
+    result = gk.sites[site].vlans[str(vlan_id)].nodes.submit(network_addresses)
+    # Possible status are 'success', 'failure' or 'unchanged'
+    failed_nodes = [node for node, res in result.items() if res["status"] == "failure"]
+    for node in failed_nodes:
+        logger.error("Failed to change VLAN of %s: %s", node, result[node]["message"])
+    if failed_nodes:
+        raise EnosG5kKavlanNodesError(vlan_id, failed_nodes)
+
+
+def get_api_username() -> str:
+    """Return username of client
+
+    Returns:
+        client's username
+    """
+    gk = get_api_client()
+    username = gk.username
+    # Anonymous connections happen on g5k frontend
+    # In this case we default to the user set in the environment
+    if username is None:
+        username = os.environ["USER"]
+    return username
+
+
+def get_all_sites_obj() -> List[Site]:
+    """Return the list of the sites.
+
+    Returns:
+       list of python-grid5000 sites
+    """
+    gk = get_api_client()
+    sites = gk.sites.list()
+    return sites
+
+
+def get_site_obj(site: str) -> Site:
+    """Get a single site.
+
+    Returns:
+        the python-grid5000 site
+    """
+    gk = get_api_client()
+    return gk.sites[site]
+
+
+def get_cluster_obj(site: str, cluster: str) -> Cluster:
+    """Get the cluster object of a single cluster.
+
+    Returns:
+        Cluster object
+    """
+    gk = get_api_client()
+    return gk.sites[site].clusters[cluster]
+
+
+def clusters_sites_obj(clusters: Iterable[str]) -> Dict[str, Site]:
+    """Get all the corresponding sites of the passed clusters.
+
+    Args:
+        clusters (list): list of the clusters (str)
+
+    Return:
+        dict corresponding to the mapping of cluster name to python-grid5000 site
+    """
+    result = {}
+    all_clusters = get_all_clusters_sites()
+    clusters_sites = {c: s for (c, s) in all_clusters.items() if c in clusters}
+    for cluster, site in clusters_sites.items():
+        # here we want the site python-grid5000 site object
+        result.update({cluster: get_site_obj(site)})
+    return result
+
+
+@lru_cache(maxsize=32)
+def get_all_clusters_sites() -> Dict[str, str]:
+    """Get all the cluster of all the sites.
+
+    Returns:
+        dict corresponding to the mapping cluster uid to python-grid5000 site
+    """
+    result: Dict = {}
+    gk = get_api_client()
+    sites = gk.sites.list()
+    for site in sites:
+        if site.uid not in gk.excluded_sites:
+            clusters: List[Cluster] = site.clusters.list()
+            result.update({c.uid: site.uid for c in clusters})
+    logger.debug(result)
+    return result
+
+
+def get_clusters_sites(clusters: Iterable[str]) -> Dict[str, str]:
+    """Get the corresponding sites of given clusters.
+
+    Args:
+        clusters (list): list of the clusters (str)
+
+    Returns:
+        dict of corresponding to the mapping cluster -> site
+    """
+    clusters_sites = get_all_clusters_sites()
+    return {c: clusters_sites[c] for c in clusters}
+
+
+def get_cluster_site(cluster: str) -> str:
+    """Get the site of a given cluster.
+
+    Args:
+        cluster (str): a Grid'5000 cluster
+
+    Returns:
+        The corresponding site(str)
+    """
+    match = get_clusters_sites([cluster])
+    return match[cluster]
+
+
+def get_nodes(cluster: str) -> List[Node]:
+    """Get all the nodes of a given cluster.
+
+    Args:
+        cluster (str): uid of the cluster (e.g 'paravance' for rennes)
+    """
+    gk = get_api_client()
+    site = get_cluster_site(cluster)
+    return gk.sites[site].clusters[cluster].nodes.list()
+
+
+def get_cores(cluster: str) -> int:
+    """Get the total number of cores in each machine for a given cluster
+
+    Args:
+        cluster (str): uid of the cluster (e.g 'paravance' for rennes)
+    """
+    return get_nodes(cluster)[-1].architecture["nb_cores"]
+
+
+def get_threads(cluster: str) -> int:
+    """Get the total number of threads in each machine for a given cluster
+
+    Args:
+        cluster (str): uid of the cluster (e.g 'paravance' for rennes)
+    """
+    return get_nodes(cluster)[-1].architecture["nb_threads"]
+
+
+def get_memory(cluster: str) -> int:
+    """Get the memory (in bytes) in each machine for a given cluster
+
+    Args:
+        cluster (str): uid of the cluster (e.g 'paravance' for rennes)
+    """
+    return get_nodes(cluster)[-1].main_memory["ram_size"]
+
+
+def get_node(site, cluster, uid) -> Node:
+    gk = get_api_client()
+    return gk.sites[site].clusters[cluster].nodes[uid]
+
+
+def get_nics(cluster: str):
+    """Get the network cards information
+
+    Args:
+        cluster (str): Grid'5000 cluster name
+
+    Returns:
+        dict of nic information
+    """
+    nodes = get_nodes(cluster)
+    nics = nodes[0].network_adapters
+    return nics
+
+
+def get_cluster_interfaces(cluster: str, extra_cond=lambda nic: True) -> List[Tuple]:
+    """Get the network interfaces names corresponding to a criteria.
+
+    Note that the cluster is passed (not the individual node names), thus it is
+    assumed that all nodes in a cluster have the same interface names same
+    configuration. In addition to ``extra_cond``, only the mountable and
+    Ehernet interfaces are returned.
+
+    Args:
+        cluster (str): the cluster to consider
+        extra_cond (lambda): boolean lambda that takes the nic(dict) as
+            parameter
+    """
+    nics = get_nics(cluster)
+    # NOTE(msimonin): Since 05/18 nics on g5k nodes have predictable names but
+    # the api description keep the legacy name (device key) and the new
+    # predictable name (key name).  The legacy names is still used for api
+    # request to the vlan endpoint This should be fixed in
+    # https://intranet.grid5000.fr/bugzilla/show_bug.cgi?id=9272
+    # When its fixed we should be able to only use the new predictable name.
+    nics = [
+        (nic["device"], nic["name"])
+        for nic in nics
+        if nic["mountable"]
+        and nic["interface"] == "Ethernet"
+        and not nic["management"]
+        and extra_cond(nic)
+    ]
+    nics = sorted(nics)
+    return nics
+
+
+def get_clusters_interfaces(clusters: Iterable, extra_cond=lambda nic: True) -> Dict:
+    """Returns for each cluster the available cluster interfaces
+
+    Args:
+        clusters (str): list of the clusters
+        extra_cond (lambda): extra predicate to filter network card retrieved
+            from the API. E.g. lambda nic: not nic['mounted'] will retrieve all
+            the usable network cards that are not mounted by default.
+
+    Returns:
+        dict of cluster with their associated nic names
+
+    Examples:
+        .. code-block:: python
+
+            # pseudo code
+            actual = get_clusters_interfaces(["paravance"])
+            expected = {"paravance": ["eth0", "eth1"]}
+            assertDictEquals(expected, actual)
+
+    """
+
+    interfaces: Dict = {}
+    for cluster in clusters:
+        nics = get_cluster_interfaces(cluster, extra_cond=extra_cond)
+        interfaces.setdefault(cluster, nics)
+
+    return interfaces
+
+
+def can_start_on_cluster(
+    nodes_status: Mapping,
+    number: int,
+    exact_nodes: List[str],
+    start: float,
+    walltime: int,
+) -> bool:
+    """Check if #nodes can be started on a given cluster.
+
+    This is intended to give a good enough approximation.
+    This can be used to prefiltered possible reservation dates before submitting
+    them on oar.
+
+    Args:
+        nodes_status: a dictionary with all the status of the nodes as
+            returned by the api (cluster status endpoint)
+        number: number of node in the demand
+        exact_nodes: the list of the fqdn of the machines to get
+        start: start time of the job
+        walltime: walltime of the job
+
+    Returns
+        True iff the job can start
+    """
+    candidates = []
+    # node is the uid, e.g: paranoia-8.rennes.grid5000.fr
+    for node, status in nodes_status.items():
+        hardware_state = status.get("hard")
+        # Dead or Suspected nodes can't be used
+        if hardware_state in ("dead", "suspected"):
+            continue
+        reservations = status.get("reservations", [])
+        # we search for the overlapping reservations
+        overlapping_reservations = []
+        for reservation in reservations:
+            queue = reservation.get("queue")
+            if queue == "besteffort":
+                # ignoring any besteffort reservation
+                continue
+            r_start = reservation.get("started_at", reservation.get("scheduled_at"))
+            if r_start is None:
+                break
+            r_start = int(r_start)
+            r_end = r_start + int(reservation["walltime"])
+            # compute segment intersection
+            _intersect = min(float(r_end), start + walltime) - max(
+                float(r_start), start
+            )
+            if _intersect > 0:
+                overlapping_reservations.append(reservation)
+        if len(overlapping_reservations) == 0:
+            # this node can be accounted for a potential reservation
+            candidates.append(node)
+    if len(candidates) >= number and set(exact_nodes).issubset(candidates):
+        return True
+    return False
+
+
+def _test_slot(
+    start: int,
+    walltime: str,
+    machines: Iterable,
+    clusters_status: Mapping,
+) -> bool:
+    """
+    This function test if it is possible at a specified start time to
+    make a reservation using the machines specified in machines dictionary
+    To do so it takes clusters_status as an entry, which is the result of api calls
+    to get the status of the corresponding clusters
+
+    Returns:
+        The return value follows this semantic:
+            - False: the proposed slot isn't available for the reservation
+            - True: the proposed start date seems to be available
+                (at the time of probing the API)
+    """
+    tz = ZoneInfo("Europe/Paris")
+    date = datetime.fromtimestamp(start, timezone.utc)
+    start = int(date.astimezone(tz=tz).timestamp())
+    _t = walltime.split(":")
+    if len(_t) != 3:
+        raise EnosG5kWalltimeFormatError()
+    _walltime = int(_t[0]) * 3600 + int(_t[1]) * 60 + int(_t[2])
+
+    # Compute the demand for each cluster
+    demands: Dict[str, int] = defaultdict(int)
+    # Keeps track of
+    exact_nodes = defaultdict(list)
+    for machine in machines:
+        cluster = machine.cluster
+        number, exact = machine.get_demands()
+        demands[cluster] += number
+        exact_nodes[cluster].extend(exact)
+
+    ko = False
+
+    for cluster, nodes in demands.items():
+        ko = ko or not can_start_on_cluster(
+            clusters_status[cluster].nodes,
+            nodes,
+            exact_nodes[cluster],
+            start,
+            _walltime,
+        )
+        if ko:
+            return False
+    if not ko:
+        # The proposed reservation_date fits
+        return True
+    return False
+
+
+@lru_cache(maxsize=32)
+def get_dns(site):
+    site_info = get_site_obj(site)
+    return site_info.servers["dns"].network_adapters["default"]["ip"]
+
+
+@lru_cache(maxsize=32)
+def get_subnet_gateway(site):
+    site_info = get_site_obj(site)
+    return site_info.g5ksubnet["gateway"]
+
+
+@lru_cache(maxsize=32)
+def get_vlans(site):
+    site_info = get_site_obj(site)
+    return site_info.kavlans
+
+
+@lru_cache(maxsize=32)
+def get_ipv6(site):
+    site_info = get_site_obj(site)
+    return site_info.ipv6
+
+
+@lru_cache(maxsize=32)
+def get_vlan(site, vlan_id) -> Vlan:
+    site_info = get_site_obj(site)
+    return site_info.vlans[vlan_id]
+
+
+@lru_cache(maxsize=32)
+def is_exotic_cluster(machine) -> bool:
+    """Indicates whether a group of machines is part of an exotic cluster or not.
+
+    Args:
+        machine (GroupConfiguration): a group of machines
+
+    Returns:
+        True if exotic, else False
+    """
+    return get_cluster_obj(machine.site, machine.cluster).exotic
+
+
+def get_clusters_status(clusters: Iterable[str]) -> Dict:
+    """Get the status of the clusters (current and future reservations)."""
+    # mapping cluster -> site
+    clusters_sites: Dict = clusters_sites_obj(clusters)
+    clusters_status = {}
+    for cluster in clusters_sites:
+        clusters_status[cluster] = (
+            clusters_sites[cluster].clusters[cluster].status.list()
+        )
+    return clusters_status
+
+
+def deploy(site: str, nodes: List[str], config: Dict) -> Tuple[List[str], List[str]]:
+    gk = get_api_client()
+    config.update(nodes=nodes)
+    deployment = gk.sites[site].deployments.create(config)
+    while deployment.status not in ["terminated", "error"]:
+        deployment.refresh()
+        logger.info("Waiting for the end of deployment [%s]", deployment.uid)
+        time.sleep(10)
+    # parse output
+    deploy = []
+    undeploy = []
+    if deployment.status == "terminated":
+        deploy = [node for node, v in deployment.result.items() if v["state"] == "OK"]
+        undeploy = [node for node, v in deployment.result.items() if v["state"] == "KO"]
+    elif deployment.status == "error":
+        undeploy = nodes
+
+    return deploy, undeploy
+
+
+def grid_get_or_create_job(
+    job_name,
+    walltime,
+    reservation_date,
+    queue,
+    job_type,
+    monitor,
+    project,
+    machines,
+    networks,
+    wait=True,
+    restrict_to: Optional[Iterable[str]] = None,
+) -> List[Job]:
+    jobs = grid_reload_jobs_from_name(job_name, restrict_to=restrict_to)
+    if len(jobs) == 0:
+        jobs = grid_make_reservation(
+            job_name,
+            walltime,
+            reservation_date,
+            queue,
+            job_type,
+            monitor,
+            project,
+            machines,
+            networks,
+        )
+    return jobs
+
+
+def _build_reservation_criteria(machines: Iterable, networks: Iterable) -> Dict:
+    criteria: Dict = {}
+    # machines reservations
+    # FIXME(msimonin): this should be refactor like this
+    # for machine in machines
+    #     machine.to_oar_string() ...
+    for config in machines:
+        # a desc is either given by
+        #  a cluster name + a number of nodes
+        # or a list of specific servers
+        # the (implicit) semantic is that if servers is given cluster and nodes
+        # are unused
+
+        # let's start with the servers case
+        site, criterion = config.oar()
+        if criterion is not None:
+            criteria.setdefault(site, []).append(criterion)
+
+    for config in networks:
+        site, criterion = config.oar()
+        if criterion is not None:
+            # in the prod case nothing is generated
+            criteria.setdefault(site, []).append(criterion)
+
+    return criteria
+
+
+def _do_grid_make_reservation(
+    criterias: Mapping,
+    job_name: str,
+    walltime,
+    reservation_date,
+    queue,
+    job_type: Union[str, MutableSequence[str]],
+    monitor,
+    project,
+) -> List[Job]:
+    job_specs: List[Tuple] = []
+    if isinstance(job_type, str):
+        job_type = [job_type]
+    if monitor is not None:
+        job_type.append(f"monitor={monitor}")
+    for site, criteria in criterias.items():
+        # since https://gitlab.inria.fr/discovery/enoslib/-/issues/236,
+        # ordering nodes reservation in OAR string for a given cluster
+        # by prioritizing specific over dynamic ones
+        criteria = sorted(criteria, key=lambda x: "network_address" in x, reverse=True)
+        resources = "+".join(criteria)
+        resources = f"{resources},walltime={walltime}"
+        job_spec = {
+            "name": job_name,
+            "types": job_type,
+            "resources": resources,
+            "command": "sleep 31536000",
+            "queue": queue,
+        }
+        if project:
+            job_spec.update(project=project)
+        if reservation_date:
+            job_spec.update(reservation=reservation_date)
+        job_specs.append((site, job_spec))
+
+    jobs = submit_jobs(job_specs)
+    return jobs
+
+
+def grid_make_reservation(
+    job_name: str,
+    walltime,
+    reservation_date,
+    queue,
+    job_type: Union[str, MutableSequence[str]],
+    monitor,
+    project,
+    machines: Iterable,
+    networks: Iterable,
+) -> List[Job]:
+    # Build the OAR criteria
+    criteria = _build_reservation_criteria(machines, networks)
+
+    # Submit them
+    jobs = _do_grid_make_reservation(
+        criteria,
+        job_name,
+        walltime,
+        reservation_date,
+        queue,
+        job_type,
+        monitor,
+        project,
+    )
+
+    return jobs
+
+
+def enable_home_for_job(job: Job, ips: List[str]):
+    """Enable access to home dir from ips.
+
+    This allows to mount the home dir corresponding to the site of job
+    from any of the ips provided.
+
+
+    Examples:
+
+        .. code-block:: python
+
+            roles, networks = provider.init()
+            # get some ips to allow
+            ips = [str(ip) for ip in networks["role"][0].network]
+
+            # get the underlying job
+            job = provider.jobs[0]
+            enable_home_for_job(job, ips)
+
+    For enabling any group storage, please refer to
+    :py:func:`~.enable_group_storage`
+
+    Args:
+        job: A (running) job.
+            home site and access duration will be inferred from
+            this job
+        ips: list of IPs
+            Every machine connecting from one of this IPs will be granted an
+            access to the home directory
+
+    """
+    username = get_api_username()
+    enable_group_storage(job.site, "home", username, ips, job)
+
+
+def enable_group_storage(
+    storage_site: str,
+    storage_server: str,
+    storage_name: str,
+    ips: List[str],
+    termination_job: Job,
+):
+    """Enable access to a group storage from ips.
+
+    Args:
+        storage_site: a grid'5000 site.
+            Site where the storage is located
+        storage_server: a server name
+            Storage server where the storage is located (e.g. ~"storage1"~  or
+            ~"home"~)
+        storage_name: name of the group storage
+            The name is the one used to identify a Group Storage (this might be
+            your username if you plan to allow your home dir)
+        ips: list of ips
+            Ips to allow the access from (only IPv4 for now).
+        termination_job: a job
+            This is used as a termination condition
+    """
+    gk = get_api_client()
+    (
+        gk.sites[storage_site]
+        .storage[storage_server]
+        .access[storage_name]
+        .rules.create(
+            {
+                "ipv4": ips,
+                "termination": {
+                    "job": termination_job.uid,
+                    "site": termination_job.site,
+                },
+            }
+        )
+    )
+
+
+def available_kwollect_metrics(nodes: Iterable[str]) -> Dict[str, List[Dict]]:
+    """Returns the description of Kwollect metrics available for a set of nodes.
+
+    Args:
+        nodes: List of nodes name
+
+    Returns:
+        dict giving a list of metrics description (as a dict) for each node.
+
+    Example return value:
+        {"gros-46.nancy.grid5000.fr": [
+           {'description': 'Power consumption of node reported by wattmetre, in watt',
+            'name': 'wattmetre_power_watt',
+            'optional_period': 20,
+            'period': 1000,
+            'source': {'protocol': 'wattmetre'}},
+           {'description': 'Default subset of metrics from Prometheus Node Exporter',
+            'name': 'prom_node_load1',
+            'optional_period': 15000,
+            'period': 0,
+            'source': {'port': 9100, 'protocol': 'prometheus'}},
+           ...
+        ]}
+    """
+    # Group nodes by (site, cluster)
+    clusters: Dict[tuple[str, str], List[str]] = defaultdict(list)
+    for node in nodes:
+        uid, site = node.split(".")[0:2]
+        cluster_name = uid.split("-")[0]
+        clusters[(site, cluster_name)].append(node)
+    # We collect (metric, list of nodes) pairs and will expand them later
+    metrics_map = []
+    # Call G5K ref-api
+    for (site, cluster_name), subnodes in clusters.items():
+        cluster = get_cluster_obj(site, cluster_name)
+        for metric in cluster.metrics:
+            # Handle prometheus metrics.  They are only listed in a
+            # subattribute of the API and need fixing (e.g. "node_load1"
+            # becomes "prom_node_load1")
+            if metric["source"]["protocol"] == "prometheus":
+                # Skip prometheus "metric" with no details
+                if "id" not in metric["source"]:
+                    continue
+                # Prepare fake metric dict that will be reused for each prom metric
+                fake_metric_template = copy.deepcopy(metric)
+                del fake_metric_template["source"]["id"]
+                for metric_name in metric["source"]["id"]:
+                    fake_metric = copy.deepcopy(fake_metric_template)
+                    fake_metric["name"] = "prom_" + metric_name
+                    metrics_map.append((fake_metric, subnodes))
+                continue
+            # Handle "only_for" restriction from API that may limit
+            # which nodes have access to the metrics
+            if "only_for" in metric:
+                relevant_nodes_set = set(metric["only_for"]) & {
+                    node.split(".")[0] for node in subnodes
+                }
+                relevant_nodes = [
+                    f"{node_uid}.{site}.grid5000.fr" for node_uid in relevant_nodes_set
+                ]
+                del metric["only_for"]
+                metrics_map.append((metric, relevant_nodes))
+            # Normal case
+            else:
+                metrics_map.append((metric, subnodes))
+    # Expand all collected metrics
+    result: Dict[str, List[Dict]] = {}
+    for metric, subnodes in metrics_map:
+        for node in subnodes:
+            if node not in result:
+                result[node] = []
+            result[node].append(metric)
+    return result
+
+
+def grid_deploy(configs):
+    # fqdns
+    terminated = 0
+    # don't forget previously deployed nodes
+    deployed_fqdns: List[str] = []
+    undeployed_fqdns: List[str] = []
+
+    gk = get_api_client()
+    deployments = []
+    # create all the deployments
+    for config in configs:
+        site = config.pop("site")
+        logger.info(f"Deploying {config['nodes']} on {site}")
+        deployments.append((gk.sites[site].deployments.create(config), config))
+        logger.info("Preparing deployment on %s with config: %s", site, config)
+
+    while terminated != len(deployments):
+        # reset previous iteration state
+        terminated = 0
+        deployed_fqdns = []
+        undeployed_fqdns = []
+
+        time.sleep(10)
+
+        for deployment, config in deployments:
+            if deployment.status not in ["terminated", "error"]:
+                deployment.refresh()
+                logger.info(
+                    "Waiting for the end of deployment [%s](processing on %s)",
+                    deployment.uid,
+                    deployment.site,
+                )
+            _deploy = []
+            _undeploy = []
+            if deployment.status == "terminated":
+                terminated = terminated + 1
+                _deploy = [
+                    node for node, v in deployment.result.items() if v["state"] == "OK"
+                ]
+                _undeploy = [
+                    node for node, v in deployment.result.items() if v["state"] == "KO"
+                ]
+                logger.info(
+                    "Waiting for the end of deployment [%s](terminated on %s)",
+                    deployment.uid,
+                    deployment.site,
+                )
+            elif deployment.status == "error":
+                terminated = terminated + 1
+                _undeploy = config["nodes"]
+                logger.info(
+                    "Waiting for the end of deployment [%s](error on %s)",
+                    deployment.uid,
+                    deployment.site,
+                )
+            deployed_fqdns += _deploy
+            undeployed_fqdns += _undeploy
+    return deployed_fqdns, undeployed_fqdns

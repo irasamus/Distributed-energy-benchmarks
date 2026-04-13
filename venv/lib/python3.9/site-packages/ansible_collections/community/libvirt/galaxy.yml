@@ -1,0 +1,17 @@
+namespace: community
+name: libvirt
+version: 1.3.0
+readme: README.md
+authors:
+  - Ansible (https://github.com/ansible)
+  - community.libvirt
+description: null
+license_file: COPYING
+tags:
+  - libvirt
+  - lxc
+  - qemu
+repository: https://github.com/ansible-collections/community.libvirt
+documentation: https://docs.ansible.com/ansible/latest/collections/community/libvirt/index.html
+homepage: https://github.com/ansible-collections/community.libvirt
+issues: https://github.com/ansible-collections/community.libvirt/issues

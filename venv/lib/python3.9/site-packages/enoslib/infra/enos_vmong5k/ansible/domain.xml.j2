@@ -1,0 +1,44 @@
+<domain type='{{ domain_type }}'>
+ <name>{{ item.alias }}</name>
+ <memory>{{ item.mem }}</memory>
+ <vcpu>{{ item.core }}</vcpu>
+ <cpu mode='host-model'/>
+ <features>
+   <acpi/>
+ </features>
+ <os>
+   <type arch="x86_64">hvm</type>
+ </os>
+ <clock offset="utc"/>
+ <on_poweroff>destroy</on_poweroff>
+ <on_reboot>restart</on_reboot>
+ <on_crash>destroy</on_crash>
+ <devices>
+   <emulator>/usr/bin/kvm</emulator>
+   <disk type='file' device='disk'>
+     <driver name='qemu' type='qcow2'/>
+     <source file='{{ libvirt_dir }}/{{ item.alias}}'/>
+     <target dev='vda' bus='virtio'/>
+   </disk>
+   <disk type='file' device='cdrom'>
+     <source file='{{ libvirt_dir }}/cloud-init-data-{{ item.alias }}.iso'/>
+     <target dev='vdb' bus='ide'/>
+     <readonly/>
+   </disk>
+   <interface type='bridge'>
+     <source bridge='br0'/>
+     <mac address='{{ item.eui }}'/>
+     <model type='virtio' />
+   </interface>
+   <serial type='pty'>
+     <source path='/dev/ttyS0'/>
+     <target port='0'/>
+   </serial>
+   <console type='pty'>
+     <source path='/dev/ttyS0'/>
+     <target port='0'/>
+   </console>
+   <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'/>
+   {{ item.extra_devices }}
+ </devices>
+</domain>

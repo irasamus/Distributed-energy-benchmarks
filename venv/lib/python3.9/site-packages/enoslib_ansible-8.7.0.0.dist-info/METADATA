@@ -1,0 +1,126 @@
+Metadata-Version: 2.1
+Name: enoslib-ansible
+Version: 8.7.0.0
+Summary: Radically simple IT automation -- For EnOSlib !
+Home-page: https://discovery.gitlabpages.inria.fr/enoslib/
+Author: EnOSlib team
+Author-email: enoslib.contact@inria.fr
+License: GPLv3+
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Environment :: Console
+Classifier: Framework :: Ansible
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
+Classifier: Intended Audience :: System Administrators
+Classifier: License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)
+Classifier: Natural Language :: English
+Classifier: Operating System :: POSIX
+Classifier: Topic :: System :: Installation/Setup
+Classifier: Topic :: System :: Systems Administration
+Classifier: Topic :: Utilities
+License-File: LICENCE
+Requires-Dist: ansible-core ~=2.15.0
+
+****************
+EnOSlib-Ansible
+****************
+
+enoslib-ansible repackages `ansible <https://pypi.org/project/ansible/>`_
+(GPLv3) exclusively tailored for the `EnOSlib project <https://discovery.gitlabpages.inria.fr>`_.
+
+The rationale behind this is that ``ansible`` includes too much collections with
+regards to what is actually needed by the EnOSlib users.
+
+
+Versionning
+===========
+
+We follow the versionning numbers of the ``ansible`` package but we append an
+internal revision number.  So for instance ``enoslib-ansible==7.5.0.1`` repackages
+the same version of a subset of collections from ``ansible==7.5.0``. 
+
+Each major version is kept in dedicated branch:  for instance ``ansible_6`` for
+repackaging ``ansible~=6``.
+
+Building
+========
+
+.. code:: bash
+
+   python setup.py bdist_wheel
+
+
+How to add a new collection
+===========================
+
+Main branch
+-----------
+
+First, work in the ``main`` branch.
+
+- Add the collection as a submodule:
+  
+.. code:: bash
+
+    git submodule add https://github.com/ansible-collections/ansible.utils ansible_collections/ansible/utils
+
+This will register the collection with its latest commit, but don't worry, we will specify a tag in a later step.
+
+- Edit ``setup.py`` to add the new collection to ``exclude_package_data`` (copy-paste existing ones)
+
+- Don't bump the version in ``setup.py``, otherwise you will have trouble cherry-picking later
+
+- Test that the package can be built:
+
+.. code:: bash
+
+   python setup.py bdist_wheel
+
+- Commit your changes
+
+Release branches
+----------------
+
+Then for each version of Ansible we support (``ansible_X`` branches):
+
+- git checkout ansible_X
+
+- Cherry-pick the commit from the master branch (with -x to track the source):
+
+.. code:: bash
+
+   git cherry-pick -x a0b1c2d3e4f5
+
+- Lookup which version of the collection should be included using `ansible-build-data <https://github.com/ansible-community/ansible-build-data>`_.
+
+  - Tip: use ``git grep ansible.utils '*.deps'`` in the ansible-build-data repository
+
+  - In general, use the latest minor version for the ansible version you target (e.g. ansible-7.7.0 for ``ansible_7``)
+
+  - For our example of ansible.utils, the result is 2.10.3
+
+- Update the submodule to the right tag:
+
+.. code:: bash
+
+   (cd ansible_collections/ansible/posix/ && git checkout vX.Y.Z)
+
+- Commit the change to the submodule
+
+- Bump version in ``setup.py``: if there already was a release for the same Ansible version (e.g. 7.7.0.0),
+  increase the fourth component (e.g. 7.7.0.1).  Otherwise, just use the Ansible version with
+  an additional 0.
+
+- Commit the version bump
+
+- Publish pip package: ``git tag vX.Y.Z.N`` and push, the CI will do the rest
+
+Troubleshooting
+---------------
+
+If you are annoyed by local changes when changing branches, use ``git submodule update``.
+
+More info
+=========
+
+- This project is based on `Antsibull project <https://github.com/ansible-community/antsibull>`_.

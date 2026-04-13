@@ -52,26 +52,32 @@ public class AppRunner {
 
     // 4. MAIN RUNNER
     public static void main(String[] args) {
-        String port = (args.length > 0) ? args[0] : "2551";
-        
-        // Setup configuration for the cluster nodes
-        String configString = 
-            "akka.actor.provider = cluster\n" +
-            "akka.actor.serialization-bindings { \"" + MySerializable.class.getName() + "\" = jackson-cbor }\n" +
-            "akka.remote.artery.canonical.hostname = \"127.0.0.1\"\n" +
-            "akka.remote.artery.canonical.port = " + port + "\n" +
-            "akka.cluster.seed-nodes = [\"akka://SpawnSystem@127.0.0.1:2551\"]";
-
-        Config config = ConfigFactory.parseString(configString);
-
-        if (port.equals("2551")) {
-            // This is Node B: It waits to spawn actors
-            ActorSystem.create(spawnerBehavior(), "SpawnSystem", config);
-        } else {
-            // This is Node A: It initiates the spawn on Node B
-            ActorSystem.create(createInitiator(), "SpawnSystem", config);
-        }
+    if (args.length < 3) {
+        System.err.println("Usage: AppRunner <port> <local_ip> <seed_ip>");
+        System.exit(1);
     }
+
+    String port = args[0];
+    String localIp = args[1];
+    String seedIp = args[2];
+
+    String configString = 
+        "akka.actor.provider = cluster\n" +
+        "akka.actor.serialization-bindings { \"com.example.AppRunner$MySerializable\" = jackson-cbor }\n" +
+        "akka.remote.artery.canonical.hostname = \"" + localIp + "\"\n" +
+        "akka.remote.artery.canonical.port = " + port + "\n" +
+        "akka.cluster.seed-nodes = [\"akka://SpawnSystem@" + seedIp + ":2551\"]";
+
+    Config config = ConfigFactory.parseString(configString);
+
+    if (port.equals("2551")) {
+        ActorSystem.create(spawnerBehavior(), "SpawnSystem", config);
+        System.out.println("Node B (Spawner) is UP on " + localIp);
+    } else {
+        ActorSystem.create(createInitiator(), "SpawnSystem", config);
+        System.out.println("Node A (Master) is UP on " + localIp + " connecting to seed " + seedIp);
+    }
+}
 
     public static Behavior<Receptionist.Listing> createInitiator() {
         return Behaviors.setup(context -> {

@@ -1,0 +1,1050 @@
+import copy
+import datetime as dt
+import logging
+import operator
+import re
+from collections import defaultdict
+from contextlib import contextmanager
+from itertools import groupby
+from pathlib import Path
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    MutableMapping,
+    MutableSequence,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
+from zoneinfo import ZoneInfo
+
+from grid5000.exceptions import Grid5000CreateError
+from sshtunnel import SSHTunnelForwarder
+
+from enoslib.api import CommandResult, CustomCommandResult, run, wait_for
+from enoslib.config import config_context
+from enoslib.errors import (
+    InvalidReservationCritical,
+    InvalidReservationTime,
+    InvalidReservationTooOld,
+    NegativeWalltime,
+)
+from enoslib.infra.enos_g5k.concrete import (
+    ConcreteClusterConf,
+    ConcreteGroup,
+    ConcreteServersConf,
+)
+from enoslib.infra.enos_g5k.constants import (
+    JOB_TYPE_DEPLOY,
+    KAVLAN_TYPE,
+    MAX_DEPLOY,
+    PROD,
+    PROD_VLAN_ID,
+    SLASH_16,
+    SLASH_22,
+)
+from enoslib.infra.enos_g5k.driver import Job, get_driver
+from enoslib.infra.enos_g5k.error import MissingNetworkError
+from enoslib.infra.enos_g5k.g5k_api_utils import (
+    OarNetwork,
+    _test_slot,
+    get_api_client,
+    get_api_username,
+    get_clusters_status,
+    grid_deploy,
+)
+from enoslib.infra.enos_g5k.objects import (
+    G5kHost,
+    G5kNetwork,
+    G5kProdNetwork,
+    G5kSubnetNetwork,
+    G5kVlanNetwork,
+)
+from enoslib.infra.enos_g5k.utils import get_ssh_keys
+from enoslib.infra.provider import Provider
+from enoslib.infra.providers import Providers
+from enoslib.infra.utils import mk_pools, pick_things
+from enoslib.log import DisableLogging, getLogger
+from enoslib.objects import Host, Networks, Roles
+
+from .configuration import (
+    ClusterConfiguration,
+    GroupConfiguration,
+    NetworkConfiguration,
+    ServersConfiguration,
+)
+
+logger = getLogger(__name__, ["G5k"])
+
+
+def _check_deployed_nodes(
+    net: G5kNetwork, nodes: List[G5kHost]
+) -> Tuple[List[G5kHost], List[G5kHost]]:
+    """This is borrowed from execo."""
+    # Translate host names using the right vlan
+    fqdns: List[str] = [node.fqdn for node in nodes]
+    node_to_addr: Dict[G5kHost, str] = {
+        node: t[1] for node, t in zip(nodes, net.translate(fqdns))
+    }
+    # Build Host list to check, forcing the use of the VLAN
+    hosts: List[Host] = [
+        node.to_enoslib(address=addr) for node, addr in node_to_addr.items()
+    ]
+    deployed = []
+    undeployed = []
+    # Deployed environments are deployed on the third partition
+    # (e.g. /dev/sdb3 or /dev/nvme0n1p3)
+    cmd = "mount | grep -q '^/dev/.*3 on / '"
+
+    # Don't display expected 'unreachable hosts' errors that may be scary
+    # to the end-users.
+    with DisableLogging(level=logging.ERROR):
+        # Also make sure we display no output (useful if the enoslib user
+        # selected a non-default callback class)
+        with config_context(ansible_stdout="noop"):
+            deployed_results = run(
+                cmd,
+                roles=hosts,
+                raw=True,
+                gather_facts=False,
+                task_name="Check deployment",
+                # Make sure we don't wait too long
+                extra_vars=dict(ansible_timeout=10),
+                # Errors are expected
+                # e.g the first time all hosts are unreachable
+                on_error_continue=True,
+            )
+    for r in deployed_results.filter(task="Check deployment"):
+        if r.ok():
+            deployed.append(r.host)
+        else:
+            undeployed.append(r.host)
+
+    # leave the fqdn world and work with G5kHost again
+    deployed = [
+        n
+        for n in nodes
+        for _, fqdn in net.translate(deployed, reverse=True)
+        if fqdn == n.fqdn
+    ]
+    undeployed = [
+        n
+        for n in nodes
+        for _, fqdn in net.translate(undeployed, reverse=True)
+        if fqdn == n.fqdn
+    ]
+
+    return deployed, undeployed
+
+
+def check_deployments(
+    hosts: List[G5kHost], force_deploy: bool, options: Dict
+) -> Tuple[List[G5kHost], List[Dict]]:
+    """Create the deployments to perform."""
+
+    def _key(host):
+        """Get the site and the primary network of a concrete description"""
+        site, _, _ = host._where
+        return site, host.primary_network
+
+    # keep track of already deployed nodes (due to a previous round of
+    # deployment)
+    already_deployed = []
+
+    s_hosts = sorted(hosts, key=_key)
+    configs = []
+    for (site, net), i_hosts in groupby(s_hosts, key=_key):
+        _hosts = list(i_hosts)
+        config = dict(**options)
+
+        hosts_to_deploy: List[G5kHost] = []
+        if not force_deploy:
+            _already_deployed, hosts_to_deploy = _check_deployed_nodes(net, _hosts)
+            already_deployed += _already_deployed
+        else:
+            hosts_to_deploy = _hosts
+
+        if len(hosts_to_deploy) > 0:
+            # Inject the nodes to deploy (use their fqdns).
+            # the deployment API use the fqdn to identify the nodes
+            config.update(nodes=[h.fqdn for h in hosts_to_deploy])
+
+            # We remove the vlan id for the productiovn
+            # network (it is undocumented behavior on G5k side) so let's not
+            # take any risk of creating a black hole.
+            if net.vlan_id and net.vlan_id != PROD_VLAN_ID:
+                config.update(vlan=net.vlan_id)
+
+            config.update(site=site)
+
+            configs.append(config)
+
+    return already_deployed, configs
+
+
+def _deploy_attempt(hosts: List[G5kHost], force_deploy: bool, options: Dict):
+    already_deployed, configs = check_deployments(hosts, force_deploy, options)
+
+    deployed_fqdns, undeployed_fqdns = grid_deploy(configs)
+    # don't forget already deployed nodes
+    deployed_fqdns += [h.fqdn for h in already_deployed]
+
+    # go back the the EnOSlib object
+    deployed = [host for host in hosts for fqdn in deployed_fqdns if host.fqdn == fqdn]
+    undeployed = [
+        host for host in hosts for fqdn in undeployed_fqdns if host.fqdn == fqdn
+    ]
+
+    return deployed, undeployed
+
+
+def deploy_with_retries(hosts: List[G5kHost], force_deploy, options):
+    deployed_hosts = []
+    undeployed_hosts = hosts
+    attempt = 0
+    while attempt < MAX_DEPLOY and undeployed_hosts:
+        deployed_hosts, undeployed_hosts = _deploy_attempt(
+            undeployed_hosts, force_deploy, options
+        )
+        attempt += 1
+
+    return deployed_hosts, undeployed_hosts
+
+
+def _run_dhcp(sshable_hosts: Sequence[G5kHost]):
+    logger.debug("Configuring network interfaces on the nodes")
+    hosts = [
+        h.to_enoslib(extra=dict(cmd=h.dhcp_networks_command())) for h in sshable_hosts
+    ]
+    # cmd might be empty
+    run(
+        "echo '' ; {{ cmd }}",
+        hosts,
+        raw=True,
+        gather_facts=False,
+        task_name="Run dhcp on the nodes",
+    )
+
+
+def _concretize_nodes(
+    group_configs: Sequence[GroupConfiguration], g5k_nodes: MutableSequence[str]
+) -> List[ConcreteGroup]:
+    """Create a mapping between the configuration and the nodes given by OAR.
+
+    The mapping *must* be fully deterministic.
+    (whatever is the order of the oar nodes in the input list)
+    Returned elements are internal object that will be combined later with
+    concrete networks to forge convenient hosts object
+    see py:func:`enoslib.infra.enos_g5k.provider._join`.
+
+    Args:
+        group_configs: list of group configuration.
+        oar_nodes: create node names as returned by OAR
+
+    Returns:
+        The mapping between every single group_config and a corresponding oar nodes.:w
+    """
+
+    # we fulfill the specific servers demands
+    _oar_nodes = copy.deepcopy(g5k_nodes)
+    servers_config = [m for m in group_configs if isinstance(m, ServersConfiguration)]
+    concrete: List[ConcreteGroup] = []
+    # intersectio between _oar_nodes and servers_config
+
+    for config in servers_config:
+        # create a concrete version
+        assert isinstance(config, ServersConfiguration)
+        _concrete_servers = []
+        # take the number of nodes requested
+        # FIXME(msimonin): we could fulfill the min requirement first
+        # and then complete with remaining nodes if needed
+        left = config.nodes
+        for s in config.servers:
+            if left == 0:
+                break
+            try:
+                _oar_nodes.remove(s)
+                _concrete_servers.append(s)
+                left = left - 1
+            except ValueError:
+                # that might happen if s is not in oar_nodes anymore
+                pass
+
+        if left > 0:
+            # The server is missing in the concrete version
+            # this shouldn't happen because it has been explicitly requested
+            logger.debug(
+                "The impossible happened: an explicitly requested "
+                "server is missing in the concrete resource"
+                "or already dispatched to another groupe"
+            )
+        c = ConcreteServersConf(_concrete_servers, config)
+        c.raise_for_min()
+        concrete.append(c)
+
+    # now with the remaining nodes we try to fulfil the requirements at the
+    # cluster level
+    snodes = sorted(_oar_nodes, key=lambda n: n)
+    pools_cluster = mk_pools(snodes, lambda n: n.split("-")[0])
+    clusters_config = [m for m in group_configs if isinstance(m, ClusterConfiguration)]
+    # We fulfill min requirements
+    # Just considering machines with min value specified
+    min_machines = sorted(clusters_config, key=operator.attrgetter("min"))
+    # keep track of the concrete here because we'll need to feed them with the
+    # remaining items
+    concrete_clusters = []
+    for cluster_config in min_machines:
+        cluster_config = cast(ClusterConfiguration, cluster_config)
+        cluster = cluster_config.cluster
+        nb = cluster_config.min
+        _concrete_servers = pick_things(pools_cluster, cluster, nb)
+        ccc = ConcreteClusterConf(_concrete_servers, cluster_config)
+        ccc.raise_for_min()
+        concrete.append(ccc)
+        concrete_clusters.append(ccc)
+
+    # We then fill the remaining without
+    # If no enough nodes are there we silently continue
+    for _concrete in concrete_clusters:
+        cc = cast(ClusterConfiguration, _concrete.config)
+        cluster = cc.cluster
+        nb = cc.nodes - len(_concrete.oar_nodes)
+        c_nodes = pick_things(pools_cluster, cluster, nb)
+        #  put concrete hostnames here
+        _concrete.oar_nodes.extend(list(c_nodes))
+
+    return concrete
+
+
+def _concretize_networks(
+    network_configs: Iterable[NetworkConfiguration], oar_networks: Iterable[OarNetwork]
+) -> List[G5kNetwork]:
+    """Create a mapping between the network configuration and the networks given by OAR.
+
+    The mapping *must* be fully deterministic.
+    (whatever is the order of the oar networks in the input list)
+
+    Args:
+        group_configs: list of group configuration.
+        oar_nodes: create node names as returned by OAR
+
+    Returns:
+        The mapping between every single group_config and a corresponding oar nodes.
+    """
+    # NOTE(msimonin): Sorting avoid non-deterministic mapping
+    # here we also sort by descriptor to differentiate between vlans
+    s_api_networks = sorted(
+        oar_networks, key=lambda n: (n.site, n.nature, n.descriptor)
+    )
+    pools = mk_pools(s_api_networks, lambda n: (n.site, n.nature))
+    g5k_networks: List[G5kNetwork] = []
+    for network_config in network_configs:
+        site = network_config.site
+        n_type = network_config.type
+        # roles and ids are important to keep as they are application specific
+        roles = network_config.roles
+        n_id = network_config.id
+        # On grid'5000 a slash_16 is 64 slash_22
+        # So if we ask for a slash_16 we return 64 sash_22
+        # yes, this smells
+        g5k_network: Optional[G5kNetwork] = None
+        if n_type == SLASH_16:
+            _networks = pick_things(pools, (site, SLASH_22), 64)
+            if _networks:
+                g5k_network = G5kSubnetNetwork(
+                    roles, n_id, site, [n.descriptor for n in _networks]
+                )
+        elif n_type == SLASH_22:
+            _networks = pick_things(pools, (site, n_type), 1)
+            if _networks:
+                g5k_network = G5kSubnetNetwork(
+                    roles, n_id, site, [n.descriptor for n in _networks]
+                )
+        elif n_type == PROD:
+            _networks = pick_things(pools, (site, n_type), 1)
+            if _networks:
+                g5k_network = G5kProdNetwork(roles, n_id, site)
+        elif n_type in KAVLAN_TYPE:
+            _networks = pick_things(pools, (site, n_type), 1)
+            if _networks:
+                g5k_network = G5kVlanNetwork(roles, n_id, site, _networks[0].descriptor)
+        else:
+            logger.error("Missing Network: are you reloading the right job ?")
+            raise MissingNetworkError(site, n_type)
+        if g5k_network is None:
+            logger.error("Missing Network: are you reloading the right job ?")
+            raise MissingNetworkError(site, n_type)
+
+        g5k_networks.append(g5k_network)
+    return g5k_networks
+
+
+def _join(
+    machines: MutableSequence[ConcreteGroup], networks: MutableSequence[G5kNetwork]
+) -> List[G5kHost]:
+    """Actually create a list of host."""
+    hosts: List[G5kHost] = []
+    for concrete_machine in machines:
+        roles = concrete_machine.config.roles
+        network_id = concrete_machine.config.primary_network.id
+        primary_network = _lookup_networks(network_id, networks)
+        secondary_networks = []
+        for s in concrete_machine.config.secondary_networks:
+            secondary_networks.append(_lookup_networks(s.id, networks))
+        for apinode in concrete_machine.oar_nodes:
+            g5k_host = G5kHost(
+                apinode,
+                roles=roles,
+                primary_network=primary_network,
+                secondary_networks=secondary_networks,
+            )
+            hosts.append(g5k_host)
+            # reference the host in the network (circular ref, use weakref if
+            # that's an issue). My understanding is that this migh not be
+            # necessary since the objects (hosts and networks) should have the
+            # same lifetime
+            primary_network.add_host(g5k_host)
+            for s in secondary_networks:
+                s.add_host(g5k_host)
+    return hosts
+
+
+class G5kTunnel:
+    """A class to initiate a tunnel to a targetted service inside Grid'5000.
+
+    Can be used as a context manager (will close the tunnel automatically).
+    Note that this is a noop when called from inside Grid'5000.
+
+    Args:
+        address: The ip address/fqdn of the targetted service
+        port: The port of the targetted service
+    """
+
+    def __init__(self, address: str, port: int, local_port: int = 0):
+        """"""
+        self.address = address
+        self.port = port
+        self.local_port = local_port
+
+        # computed
+        self.tunnel: Optional[SSHTunnelForwarder] = None
+
+    def start(self) -> Tuple[str, int, Optional[SSHTunnelForwarder]]:
+        """Start the tunnel.
+
+        Returns:
+            A tuple composed of the local address , the local port and the
+            tunnel object (if any)
+        """
+        import socket
+
+        if "grid5000.fr" not in socket.getfqdn():
+            logging.debug("Creating a tunnel to %s:%s", self.address, self.port)
+            self.tunnel = SSHTunnelForwarder(
+                "access.grid5000.fr",
+                ssh_username=get_api_username(),
+                remote_bind_address=(self.address, self.port),
+                local_bind_address=("127.0.0.1", self.local_port),
+            )
+            if self.tunnel is not None:
+                self.tunnel.start()
+                local_address, local_port = self.tunnel.local_bind_address
+                return local_address, local_port, self.tunnel
+        return self.address, self.port, None
+
+    def close(self):
+        """Close the tunnel.
+
+        Note that this won't wait for any connection to finish first."""
+        if self.tunnel is not None:
+            logging.debug("Closing the tunnel to %s:%s", self.address, self.port)
+            self.tunnel.stop(force=True)
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def check() -> List[Tuple[str, bool, str]]:
+    # first check ssh to access.grid5000.fr
+    statuses = []
+    user = None
+
+    try:
+        # Get the username
+        # This might be empty and valid when running from a frontend
+        user = get_api_username()
+    except Exception as e:
+        statuses.append(("api:conf", False, str(e)))
+        # no need to continue
+        return statuses
+
+    access = Host("access.grid5000.fr", user=get_api_username())
+    # beware: on access the homedir isn't writable (so using raw)
+    r = run(
+        "hostname",
+        access,
+        raw=True,
+        on_error_continue=True,
+        task_name=f"Connecting to {user}@{access.alias}",
+    )
+    if isinstance(r[0], CommandResult):
+        statuses.append(
+            (
+                "ssh:access",
+                r[0].rc == 0,
+                r[0].stderr if r[0].rc != 0 else f"Connection to {access.alias}",
+            )
+        )
+    elif isinstance(r[0], CustomCommandResult):
+        # hostname don't fail so if we get an error at this point
+        # it's because of the connection
+        # The result in this case is a CustomCommandResult
+        # see:
+        # CustomCommandResult(host='acces.grid5000.fr', task='Connecting to
+        # msimonin@acces.grid5000.fr', status='UNREACHABLE',
+        # payload={'unreachable': True, 'msg': 'Failed to connect to the host
+        # via ssh: channel 0: open failed: administratively prohibited: open
+        # failed\r\nstdio forwarding failed\r\nssh_exchange_identification:
+        # Connection closed by remote host', 'changed': False})
+        statuses.append(("ssh:access", False, r[0].payload["msg"]))
+        # no need to continue if that's failing
+        return statuses
+    else:
+        raise ValueError("Impossible command result type received, this is a bug")
+
+    one_frontend = Host("rennes.grid5000.fr", user=get_api_username())
+    r = run(
+        "hostname",
+        access,
+        raw=True,
+        on_error_continue=True,
+        task_name=f"Connecting to {user}@{access.alias}",
+    )
+    if r[0].rc == 0:
+        statuses.append(("ssh:access:frontend", True, f"Connection {one_frontend}"))
+    else:
+        # see above
+        statuses.append(("ssh:access:frontend", False, r[0].payload["msg"]))
+
+    try:
+        gk = get_api_client()
+        _ = gk.sites.list()
+    except Exception as e:
+        statuses.append(("api:access", False, str(e)))
+        return statuses
+
+    # all clear
+    statuses.append(("api:access", True, ""))
+
+    return statuses
+
+
+class G5kBase(Provider):
+    """Internal class.
+
+    Provider dedicated to single site interaction.
+
+    Attributes:
+        jobs (list): List of `Grid'5000 Job objects
+            <https://api.grid5000.fr/doc/stable/#tag/job/paths/~1stable~1sites~1{siteId}~1jobs~1{jobId}/get>`_
+            managed by this provider
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # make sure we are dealing with a single site
+        self.driver = get_driver(self.provider_conf)
+        # will hold the concrete version of the hosts
+        self.hosts: List[G5kHost] = []
+        # will hold the concrete version of the networks
+        self.networks: List = []
+        # will hold the concrete hosts deployed/undeployed after calling (ka)deploy3
+        self.deployed: List[G5kHost] = []
+        self.undeployed: List[G5kHost] = []
+
+        # will hold the hosts reachable through ssh
+        # - if no deployment has been performed, this will be self.hosts
+        # - if a deployment has been performed, this will be self.deployed
+        self.sshable_hosts: List[G5kHost] = []
+
+        # will hold the status of the cluster
+        self.clusters_status = None
+
+    def init(
+        self, force_deploy: bool = False, start_time: Optional[int] = None, **kwargs
+    ) -> Tuple[Roles, Networks]:
+        """Take ownership over some Grid'5000 resources (compute and networks).
+
+        The function does the heavy lifting of transforming your
+        abstract resource configuration into concrete resources.
+
+        From a high level perspective it works as follow:
+
+        - First it transforms the configuration of resources into an actual
+          OAR resource selection string (one single reservation per provider
+          instance).
+        - It requests the API to get the corresponding resources (job and
+          optionally deploys a environment)
+        - Those resources are then mapped back to every single item on the
+          configuration.
+        - Finally it applies some more operations (set nodes on vlans,
+          configure secondary interfaces) before returning.
+
+        .. note::
+
+            The call to the function is **idempotent** and the following is ensured:
+
+            - Existing job(s) (based on the name) will be reloaded.
+            - The mapping between concrete resources and their corresponding roles
+              is fixed across runs. This includes:
+
+              - the mapping between machines and roles
+              - the mapping between networks and roles
+              - the mapping between network cards and networks
+
+            - Deployments is performed only on nodes that are not deployed yet
+              (up to three attempts).
+            - At the end machine are reachable using the root account.
+
+        Args:
+            force_deploy (bool):
+                True iff the environment must be redeployed
+            start_time (timestamp (int)):
+                Time at which to start the job, by default whenever
+                possible
+
+        Raises:
+            MissingNetworkError:
+                If one network is missing in comparison to what is claimed.
+            NotEnoughNodesError:
+                If the `min` constraints can't be met.
+            InvalidReservationTime:
+                If the set reservation_date from provider.conf isn't free
+            InvalidReservationOld:
+                If the set reservation_date from provider.conf is in the past
+            InvalidReservationCritical:
+                Any other error that might occur during the reservation is deemed
+                critical
+
+        Returns:
+            Two dictionaries (roles, networks) representing the inventory of
+            resources.
+        """
+        _force_deploy = self.provider_conf.force_deploy
+        self.provider_conf.force_deploy = _force_deploy or force_deploy
+        if start_time:
+            self.set_reservation(start_time)
+        self.networks = []
+        self.hosts = []
+        self.launch()
+        return self._to_enoslib()
+
+    def ensure_reserved(self):
+        self.reserve()
+
+    def destroy(self, wait: bool = True, **kwargs):
+        """Destroys the jobs."""
+        self.driver.destroy(wait=wait)
+
+    @property
+    def jobs(self) -> List[Job]:
+        return self.driver.get_jobs()
+
+    def deploy(self): ...
+
+    def launch(self):
+        self.reserve()
+        self.wait()
+
+        oar_nodes, oar_networks = self.driver.resources()
+        machines = _concretize_nodes(self.provider_conf.machines, oar_nodes)
+        self.networks = _concretize_networks(self.provider_conf.networks, oar_networks)
+        self.hosts = _join(machines, self.networks)
+
+        # trigger necessary side effects on the API for instance
+        for h in self.hosts:
+            h.mirror_state()
+
+        self.sshable_hosts = self.hosts
+
+        if JOB_TYPE_DEPLOY in self.provider_conf.job_type:
+            self.deploy()
+            self.wait_nodes()
+            self.dhcp_networks()
+        else:
+            # TODO: let user opt out of this
+            # even if they won't do much with enoslib in this case.
+            self.grant_root_access()
+
+    @staticmethod
+    def timezone():
+        return ZoneInfo("Europe/Paris")
+
+    def reserve(self):
+        try:
+            # this is async (will keep the info of the jobs)
+            self.driver.reserve()
+        except Grid5000CreateError as error:
+            # OAR is kind enough to provide an estimate for a possible start time.
+            # we capture this start time (if it exists in the error) to forge a special
+            # error. This error is used for example in a multi-providers setting
+            # to update the search window of the common slot.
+            search = re.search(
+                r"Reservation not valid --> KO \(This reservation could run at (\d{4}-"
+                r"\d{2}-\d{2} \d{2}:\d{2}:\d{2})\)",
+                format(error),
+            )
+            if search is not None:
+                date = dt.datetime.strptime(search.group(1), "%Y-%m-%d %H:%M:%S")
+                date = date.replace(tzinfo=self.timezone())
+                raise InvalidReservationTime(date) from error
+            search = re.search(
+                "Reservation too old",
+                format(error),
+            )
+            if search is not None:
+                raise InvalidReservationTooOld() from error
+            else:
+                raise InvalidReservationCritical(format(error)) from error
+
+    def async_init(self, start_time: Optional[int] = None, **kwargs):
+        """Reserve but don't wait.
+
+        No node/network information can't be retrieved at this moment.
+        If a start_time is provided, set the reservation date to it.
+        """
+        if start_time:
+            self.set_reservation(start_time)
+        self.reserve()
+
+    def wait(self):
+        self.driver.wait()
+
+    def wait_nodes(self):
+        hosts = [h.to_enoslib() for h in self.sshable_hosts]
+        wait_for(hosts)
+
+    def dhcp_networks(self):
+        dhcp = self.provider_conf.dhcp
+        if dhcp:
+            _run_dhcp(self.sshable_hosts)
+
+    def grant_root_access(self):
+        hosts = [
+            h.to_enoslib(
+                user=self.driver.get_user(),
+                extra=dict(cmd=h.grant_root_access_command()),
+            )
+            for h in self.sshable_hosts
+        ]
+        run(
+            "{{ cmd }}", hosts, task_name="Granting root access on the nodes (sudo-g5k)"
+        )
+
+    def _to_enoslib(self) -> Tuple[Roles, Networks]:
+        """Transform from provider specific resources to framework resources."""
+        # index the host by their associated roles
+        hosts = Roles()
+        # used to de-duplicate host objects in the roles datastructure
+        _hosts: List[Host] = []
+        for host in self.sshable_hosts:
+            h: Host = host.to_enoslib()
+            if h in _hosts:
+                h = _hosts[_hosts.index(h)]
+            else:
+                _hosts.append(h)
+            hosts.add_one(h, host.roles)
+
+        # doing the same on networks
+        networks = Networks()
+        _networks: List[G5kNetwork] = []
+        for network in self.networks:
+            roles, enos_networks = network.to_enos()
+            for enos_network in enos_networks:
+                if enos_network in _networks:
+                    net = _networks[_networks.index(enos_network)]
+                else:
+                    net = enos_network
+                    _networks.append(net)
+                networks.add_one(net, roles)
+        return hosts, networks
+
+    @staticmethod
+    def tunnel(
+        address: str, port: int
+    ) -> Tuple[str, int, Optional[SSHTunnelForwarder]]:
+        """Create a tunnel if necessary between here and there (in G5k).
+
+        Args:
+            address (str):
+                The remote address to reach (assuming inside g5k)
+            port (int):
+                The remote port to reach
+
+        Returns:
+            The context manager
+        """
+        return G5kTunnel(address, port).start()
+
+    @contextmanager
+    def firewall(
+        self,
+        hosts: Optional[Iterable[Host]] = None,
+        port: Optional[Union[int, List[int]]] = None,
+        src_addr: Optional[Union[str, List[str]]] = None,
+        proto: str = "tcp+udp",
+    ):
+        """Context manager to manage firewall rules
+
+        - Create a firewall opening when entering
+        - Delete the firewall opening when exiting
+
+        Args:
+            hosts:
+                limit the rule to a set of hosts.
+                if None, rules will be applied on all hosts of all underlying jobs.
+            port:
+                ports to open
+            src_addr:
+                source addresses to consider
+            proto:
+                protocol to consider
+        """
+        self.fw_create(hosts=hosts, port=port, src_addr=src_addr, proto=proto)
+        try:
+            yield
+        except Exception as e:
+            raise e
+        finally:
+            self.fw_delete()
+
+    def fw_delete(self):
+        """Delete all existing rules."""
+        jobs = self.driver.get_jobs()
+        for job in jobs:
+            logger.info(f"Removing firewall rules for job({job.uid})")
+            job.firewall.delete()
+
+    def fw_create(
+        self,
+        hosts: Optional[Iterable[Host]] = None,
+        port: Optional[Union[int, List[int]]] = None,
+        src_addr: Optional[Union[str, List[str]]] = None,
+        proto: str = "tcp+udp",
+    ):
+        """Create a firewall rules
+
+        Reference: https://www.grid5000.fr/w/Reconfigurable_Firewall
+
+        Note that ``port`` and ``src_addr`` and ``proto`` are passed to the API
+        calls without any change. It means that accepted values are those
+        accepted by the REST API.
+
+        Args:
+            hosts:
+                limit the rule to a set of hosts.
+                if None, rules will be applied on all hosts of all underlying jobs.
+            port:
+                ports to open
+            src_addr:
+                source addresses to consider
+            proto:
+                protocol to consider
+        """
+
+        def to_ipv6_dests(hosts: Iterable[str]):
+            """util function to build the ipv6node string."""
+            dests = []
+            for dest in hosts:
+                _dest = dest.split(".")
+                _dest = [f"{_dest[0]}-ipv6"] + _dest[1:]
+                dests.append(".".join(_dest))
+            return dests
+
+        jobs = self.driver.get_jobs()
+
+        data: Dict[str, Any] = {}
+        data.update(proto=proto)
+        if port is not None:
+            # cannot give port if proto == all"
+            data.update(port=port)
+        if src_addr is not None:
+            # src_addr is optional
+            data.update(src_addr=src_addr)
+
+        for job in jobs:
+            # build the destinations to consider
+            # that either the set of all the nodes of the jobs
+            # or only the one corresponding to the hosts passed
+            assigned_hosts = job.assigned_nodes
+            if hosts is not None:
+                limit_hosts = [h.alias for h in hosts]
+            else:
+                limit_hosts = assigned_hosts
+            # restrict the list of addr to consider
+            # this is supposed to be a neutral operation if
+            # hosts=None
+            addrs = to_ipv6_dests(set(assigned_hosts).intersection(limit_hosts))
+            data.update(addr=addrs)
+            logger.info(f"Creating firewall rules {data}")
+            job.firewall.create([data])
+
+    def test_slot(self, start_time: int, end_time: int) -> bool:
+        """Test if it is possible to reserve the configuration corresponding
+        to this provider at start_time"""
+        demands: MutableMapping[str, int] = defaultdict(int)
+        exact_nodes = defaultdict(list)
+        for machine in self.provider_conf.machines:
+            cluster = machine.cluster
+            number, exact = machine.get_demands()
+            demands[cluster] += number
+            exact_nodes[cluster].extend(exact)
+
+        if self.clusters_status is None:
+            self.clusters_status = get_clusters_status(demands.keys())
+
+        return _test_slot(
+            start_time,
+            self.provider_conf.walltime,
+            self.provider_conf.machines,
+            self.clusters_status,
+        )
+
+    def set_reservation(self, timestamp: int):
+        date = dt.datetime.fromtimestamp(timestamp, dt.timezone.utc)
+        date = date.astimezone(tz=self.timezone())
+        self.provider_conf.reservation = date.strftime("%Y-%m-%d %H:%M:%S")
+        self.driver.reservation_date = self.provider_conf.reservation
+
+    def offset_walltime(self, offset: int):
+        walltime_part = self.provider_conf.walltime.split(":")
+        walltime_sec = (
+            int(walltime_part[0]) * 3600
+            + int(walltime_part[1]) * 60
+            + int(walltime_part[2])
+            + offset
+        )
+        if walltime_sec <= 0:
+            raise NegativeWalltime
+        new_walltime = dt.time(
+            hour=int(walltime_sec / 3600),
+            minute=int((walltime_sec % 3600) / 60),
+            second=int(walltime_sec % 60),
+        )
+
+        self.provider_conf.walltime = new_walltime.strftime("%H:%M:%S")
+
+    def is_created(self) -> bool:
+        return len(self.driver.get_jobs()) != 0
+
+
+class G5k(G5kBase):
+    """The provider to use when interacting with Grid'5000.
+
+    Most of the methods are inherited
+    from :py:class:`~enoslib.infra.enos_g5k.provider.G5kBase`.
+    """
+
+    def reserve(self):
+        """Reserve the resources described in the configuration
+
+        This support multisite configuration.
+        """
+        sites = self.provider_conf.sites
+
+        if len(sites) == 1:
+            # follow the super behaviour
+            # which is scoped to one single site anyway.
+            # This avoid to go through the synchronization logic for a single site
+            super().reserve()
+        else:
+            # Use a temporary Providers instance to secure the resources.  Self
+            # being scoped to several sites the set of reserved resources will
+            # be reloaded by the current class in the subsequent steps event if
+            # they have been reserved by the temporary Providers instance.
+            confs_per_site = [self.provider_conf.restrict_to(site) for site in sites]
+            providers = Providers([G5kBase(conf) for conf in confs_per_site])
+
+            if self.provider_conf.reservation is not None:
+                date = dt.datetime.strptime(
+                    self.provider_conf.reservation,
+                    "%Y-%m-%d %H:%M:%S",
+                ).astimezone(tz=dt.timezone.utc)
+                start_time = int(date.timestamp())
+            else:
+                start_time = None
+
+            providers.async_init(start_time=start_time)
+
+    def deploy(self):
+        # Should we deploy whatever the previous state ?
+        force_deploy = self.provider_conf.force_deploy
+
+        # keep track of sshable hosts == deployed ones
+        self.sshable_hosts = []
+
+        # keep track of deploy/undeployed host globally
+        self.deployed = []
+        self.undeployed = self.hosts
+
+        # handle deployment options
+        # key option  config.update(environment=config.env_name)
+        options = dict(environment=self.provider_conf.env_name)
+
+        if self.provider_conf.env_version is not None:
+            options.update(version=self.provider_conf.env_version)
+
+        input_key_path = self.provider_conf.key
+
+        if input_key_path:
+            key_path = Path(input_key_path)
+            if not key_path.is_file():
+                raise FileNotFoundError(
+                    f"This path for the SSH key doesn't exist : {key_path}"
+                )
+            key_content = key_path.read_text().strip()
+            if not key_content:
+                raise ValueError(
+                    f"This path for the SSH key leads to an empty file : {key_path}"
+                )
+            options.update(key=key_content)
+            logger.info(
+                "Deploying the public key contained in %s to remote hosts.", key_path
+            )
+
+        # If no key path given
+        else:
+            # Calling this function might raise an error
+            keys_content = get_ssh_keys()
+            options.update(key=keys_content)
+            logger.info(
+                f"Deploying all public keys contained in {Path.home()}/.ssh "
+                "to remote hosts."
+            )
+
+        self.deployed, self.undeployed = deploy_with_retries(
+            self.hosts, force_deploy, options
+        )
+
+        # update sshable_hosts
+        for deployed in self.deployed:
+            _, t_fqdn = deployed.primary_network.translate([deployed.fqdn])[0]
+            deployed.ssh_address = t_fqdn
+            self.sshable_hosts += [deployed]
+
+
+def _lookup_networks(network_id: str, networks: Iterable[G5kNetwork]) -> G5kNetwork:
+    """What is the concrete network corresponding the network declared in the conf.
+
+    We'll need to review that, later.
+    """
+    match = [net for net in networks if net.id == network_id]
+    # if it has been validated the following is valid
+    return match[0]

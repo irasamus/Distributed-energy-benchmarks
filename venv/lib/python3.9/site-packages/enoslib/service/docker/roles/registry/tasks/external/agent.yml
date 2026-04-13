@@ -1,0 +1,4 @@
+---
+- include_tasks: ../install_agent.yml
+
+- include_tasks: ../insecure_registry.yml

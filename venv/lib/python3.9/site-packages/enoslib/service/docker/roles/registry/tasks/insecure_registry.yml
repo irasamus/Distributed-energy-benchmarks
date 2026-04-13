@@ -1,0 +1,15 @@
+- name: Create docker config directory
+  file:
+    path: /etc/docker/
+    state: directory
+
+- name: Allow Docker to use an insecure registry
+  template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+
+- name: Restart docker daemon
+  systemd:
+    name: docker
+    state: restarted
+    daemon_reload: yes
