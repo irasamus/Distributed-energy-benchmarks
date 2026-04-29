@@ -11,10 +11,10 @@ JOB_NAME = "energy_setup"
 
 # Paradoxe Cluster Nodes 3, 4, and 5
 conf = (
-    en.G5kConf.from_settings(job_name=JOB_NAME, job_type=["deploy"], env_name="ubuntu2204-x64-min", walltime="05:00:00")
-    .add_machine(roles=["n1"], servers=["neowise-1.lyon.grid5000.fr"])
-    .add_machine(roles=["n2"], servers=["neowise-2.lyon.grid5000.fr"])
-    .add_machine(roles=["n3"], servers=["neowise-3.lyon.grid5000.fr"])
+    en.G5kConf.from_settings(job_name=JOB_NAME, job_type=["deploy"], env_name="ubuntu2204-x64-min", walltime="03:00:00")
+    .add_machine(roles=["n1"], servers=["paradoxe-11.rennes.grid5000.fr"])
+    .add_machine(roles=["n2"], servers=["paradoxe-12.rennes.grid5000.fr"])
+    .add_machine(roles=["n3"], servers=["paradoxe-13.rennes.grid5000.fr"])
 )
 
 provider = en.G5k(conf)
