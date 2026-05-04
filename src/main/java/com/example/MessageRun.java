@@ -115,7 +115,7 @@ public class MessageRun {
         String port = args[0];
         String localIp = args[1];
         String seedIp = args[2];
-        int messageLimit = 1000000; 
+        int messageLimit = 10000; 
 
         String configString = 
             "akka.actor.provider = cluster\n" +

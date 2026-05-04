@@ -11,7 +11,7 @@ public class TrapezoidRun {
 
     // --- 1. MATHEMATICAL FUNCTION ---
     static double fx(double x) {
-        return Math.sin(x) * Math.cos(x) * Math.sqrt(x);
+        return (1.0 / (x + 1.0)) * (1.0 + Math.exp(Math.sqrt(2.0 * x)) * Math.sin(Math.pow(x, 3.0) - 1.0));
     }
 
     // --- 2. MESSAGES ---
@@ -133,7 +133,7 @@ public class TrapezoidRun {
         String localIp = args[1];
         String seedIp = args[2];
         
-        long totalIntervals = 1000000000L; 
+        long totalIntervals = 1000L; 
         int numWorkersExpected = 2; // Node 2551 and Node 2553
 
         String configString = 

@@ -55,8 +55,8 @@ def run_elixir_bench(name, file_name, master_args):
 
 # 3. RUN ALL TESTS
 # Note: Check your GitHub for the exact capitalization of filenames!
-run_elixir_bench("SPAWN", "DistSpawner.exs", f"worker@{ip1}")
-run_elixir_bench("MESSAGE", "dist_message.exs", f"worker@{ip1}")
+#run_elixir_bench("SPAWN", "DistSpawner.exs", f"worker@{ip1}")
+#run_elixir_bench("MESSAGE", "dist_message.exs", f"worker@{ip1}")
 run_elixir_bench("TRAPEZOID", "dist_trapezoid.exs", f"worker@{ip1} worker@{ip3}")
 
 print("\n--- ALL ELIXIR BENCHMARKS COMPLETE ---")

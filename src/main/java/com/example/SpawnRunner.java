@@ -108,7 +108,7 @@ public class SpawnRunner {
         String port = args[0];
         String localIp = args[1];
         String seedIp = args[2];
-        int totalToSpawn = 1000000; 
+        int totalToSpawn = 1000; 
 
         String configString = 
             "akka.actor.provider = cluster\n" +
