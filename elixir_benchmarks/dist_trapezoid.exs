@@ -1,5 +1,5 @@
 defmodule Trapezoid do
-  @total_intervals 1_000
+  @total_intervals 500_000_000
 
   def fx(x), do: (1.0 / (x + 1.0)) * (1.0 + :math.exp(:math.sqrt(2.0 * x)) * :math.sin(:math.pow(x, 3.0) - 1.0))
 
