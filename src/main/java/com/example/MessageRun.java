@@ -77,7 +77,7 @@ public class MessageRun {
         String port = args[0];
         String localIp = args[1];
         String seedIp = args[2];
-        int messageLimit = 2000000; // Match Elixir
+        int messageLimit = 1000000; // Match Elixir
 
         Config config = ConfigFactory.parseString(
             "akka.actor.provider = cluster\n" +

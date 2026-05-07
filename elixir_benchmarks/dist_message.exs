@@ -1,5 +1,5 @@
 defmodule PingPong do
-  @total_messages 2_000_000
+  @total_messages 1_000_000
 
   def ponger_loop do
     receive do

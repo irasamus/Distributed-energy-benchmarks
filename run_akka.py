@@ -5,9 +5,9 @@ import re
 en.init_logging(level=en.logging.INFO)
 
 roles = {
-    "n1": [en.Host("paradoxe-7.rennes.grid5000.fr", user="root")],
-    "n2": [en.Host("paradoxe-8.rennes.grid5000.fr", user="root")],
-    "n3": [en.Host("paradoxe-9.rennes.grid5000.fr", user="root")]
+    "n1": [en.Host("paradoxe-11.rennes.grid5000.fr", user="root")],
+    "n2": [en.Host("paradoxe-12.rennes.grid5000.fr", user="root")],
+    "n3": [en.Host("paradoxe-13.rennes.grid5000.fr", user="root")]
 }
 all_hosts = roles["n1"] + roles["n2"] + roles["n3"]
 

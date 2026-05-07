@@ -1,5 +1,5 @@
 defmodule DistSpawner do
-  @total_actors 500_000
+  @total_actors 100_000
 
   def worker_task(parent) do
     send(parent, :done)
