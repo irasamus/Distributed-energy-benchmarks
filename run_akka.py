@@ -59,7 +59,7 @@ def run_akka_fast(name, main_class, master_port, extra_worker=False):
 
 # --- 2. EXECUTION ---
 # Change counts in your Java files to: 100k Spawn, 1M Message, 1B Trapezoid for a quick test
-run_akka_fast("SPAWN", "com.example.SpawnRunner", "2552")
+#run_akka_fast("SPAWN", "com.example.SpawnRunner", "2552")
 run_akka_fast("MESSAGE", "com.example.MessageRun", "2552")
 run_akka_fast("TRAPEZOID", "com.example.TrapezoidRun", "2552", extra_worker=True)
 

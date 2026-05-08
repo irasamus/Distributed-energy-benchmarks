@@ -133,7 +133,7 @@ public class TrapezoidRun {
         String localIp = args[1];
         String seedIp = args[2];
         
-        long totalIntervals = 5000000L; 
+        long totalIntervals = 2000000000L; 
         int numWorkersExpected = 2; // Node 2551 and Node 2553
 
         String configString = 
