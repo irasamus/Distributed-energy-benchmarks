@@ -9,3 +9,13 @@ deps/
 
 # OS files
 .DS_Store
+
+# Results and data
+energy_results/
+*.json
+
+# Python and virtual environments
+*.py
+venv/
+.venv/
+__pycache__/
